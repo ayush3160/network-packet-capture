@@ -1,0 +1,24 @@
+[*] Creating veth pair: veth0 <-> veth1
+sudo: unable to resolve host lima-debian-12: Name or service not known
+[*] Assigning MACs
+sudo: unable to resolve host lima-debian-12: Name or service not known
+sudo: unable to resolve host lima-debian-12: Name or service not known
+[*] Assigning IPs
+sudo: unable to resolve host lima-debian-12: Name or service not known
+sudo: unable to resolve host lima-debian-12: Name or service not known
+sudo: unable to resolve host lima-debian-12: Name or service not known
+sudo: unable to resolve host lima-debian-12: Name or service not known
+[*] Step 1: Convert Loopback PCAP -> Ethernet frames
+tcprewrite --dlt=enet --enet-smac="02:11:22:33:44:55" --enet-dmac="02:66:77:88:99:aa" --fixcsum --cachefile="/tmp/tmp.Os6CYZkkfo/cache.txt" --infile="capture.pcap" --outfile="/tmp/tmp.Os6CYZkkfo/ethernet_ready.pcap"
+[*] Step 2: Force endpoints to 192.168.100.1 <-> 192.168.100.2 (client<->server)
+tcprewrite --endpoints="192.168.100.1:192.168.100.2" --cachefile="/tmp/tmp.Os6CYZkkfo/cache.txt" --fixcsum --infile="/tmp/tmp.Os6CYZkkfo/ethernet_ready.pcap" --outfile="/tmp/tmp.Os6CYZkkfo/replay_ready.pcap"
+[*] Extracting candidate server-side TCP destination ports from PCAP…
+[*] Step 3: Starting up to 32 listeners on 192.168.100.2 for ports: 16789
+[*] Step 4: Replaying via tcplivereplay on veth0
+sudo: unable to resolve host lima-debian-12: Name or service not known
+ERROR: Incorrect Usage!
+Usage: tcpliveplay <eth0/eth1> <file.pcap> <Destination IP [1.2.3.4]> <Destination mac [0a:1b:2c:3d:4e:5f]> <specify 'random' or specific port#>
+Example:
+    yhsiam@yhsiam-VirtualBox:~$ sudo tcpliveplay eth0 test1.pcap 192.168.1.4 52:57:01:11:31:92 random
+
+[*] Done. You can inspect traffic with:  tcpdump -i veth1 -n
