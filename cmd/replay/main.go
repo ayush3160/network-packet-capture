@@ -5,5 +5,5 @@ import (
 )
 
 func main() {
-	replay.StartReplay()
+	replay.StartReplay2()
 }

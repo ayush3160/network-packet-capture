@@ -43,6 +43,12 @@ type flowKey struct {
 	srcPort, dstPt uint16
 }
 
+type flowKeyDup2 struct {
+	srcIP, dstIP   string
+	srcPort, dstPt uint16
+	payload        []byte // TCP payload only; used for matching
+}
+
 type stream struct {
 	key   flowKey
 	pkts  []pkt     // in capture order (see NOTE about tcpassembly)
@@ -97,7 +103,7 @@ func StartReplay() {
 	flag.BoolVar(&preserveTiming, "preserveTiming", false, "Sleep according to inter-packet gaps per stream")
 	flag.DurationVar(&connectTimeout, "connectTimeout", 5*time.Second, "Dial timeout for live sockets")
 	flag.DurationVar(&writeDelay, "writeDelay", 0, "Fixed delay between packet writes (added after preserveTiming)")
-	flag.IntVar(&concurrency, "concurrency", 8, "Max parallel stream replays per direction")
+	flag.IntVar(&concurrency, "concurrency", 1, "Max parallel stream replays per direction")
 	flag.Parse()
 
 	if pcapPath == "" {
@@ -126,82 +132,10 @@ func StartReplay() {
 	// Decode loop: collect payloads for the 2 directions of interest
 	col := newFlows()
 
-	// var eth layers.Ethernet
-	// var sll layers.LinuxSLL
-	// var sll2 layers.LinuxSLL2
-	// var ipv4 layers.IPv4
-	// var ipv6 layers.IPv6
-	// var tcp layers.TCP
-	// parser := gopacket.NewDecodingLayerParser(gopacket.LayerType(link), &eth, &sll, &sll2, &ipv4, &ipv6, &tcp)
-	// decoded := []gopacket.LayerType{}
+	srcPorts := make(map[uint16][]flowKeyDup) // src ports seen in the capture
 
 	packetCount := 0
 	for {
-		// data, ci, err := r.ReadPacketData()
-		// if err != nil {
-		// 	log.Printf("[DEBUG] Error reading packet data: %v", err)
-		// 	if errors.Is(err, os.ErrClosed) {
-		// 		break
-		// 	}
-		// 	if err.Error() == "EOF" {
-		// 		break
-		// 	}
-		// 	if strings.Contains(err.Error(), "EOF") {
-		// 		break
-		// 	}
-		// 	// non-fatal: stop on EOF
-		// 	break
-		// }
-		// packetCount++
-		// log.Printf("[DEBUG] Packet #%d read at %v, length=%d", packetCount, ci.Timestamp, len(data))
-
-		// err = dc.parser.DecodeLayers(data, &decoded)
-
-		// if err != nil {
-
-		// 	// Try to decode SLL/SLL2 with forced IPv4/IPv6
-		// 	if !decodeWithSLL2Fallback(link, dc, data, &decoded) {
-		// 		log.Printf("[DEBUG] Failed to decode layers for packet #%d: %v", packetCount, err)
-		// 		continue // keep going; we only care about TCP with payload
-		// 	}
-
-		// }
-
-		// log.Printf("[DEBUG] Decoded layers for packet #%d: %v", packetCount, decoded)
-
-		// var srcIP, dstIP string
-		// switch {
-		// case dc.ip4.Version == 4 && len(dc.ip4.SrcIP) > 0:
-		// 	srcIP, dstIP = dc.ip4.SrcIP.String(), dc.ip4.DstIP.String()
-		// 	log.Printf("[DEBUG] IPv4 src=%s dst=%s", srcIP, dstIP)
-		// case dc.ip6.Version == 6 && len(dc.ip6.SrcIP) > 0:
-		// 	srcIP, dstIP = dc.ip6.SrcIP.String(), dc.ip6.DstIP.String()
-		// 	log.Printf("[DEBUG] IPv6 src=%s dst=%s", srcIP, dstIP)
-		// default:
-		// 	log.Printf("[DEBUG] No valid IP layer found in packet #%d", packetCount)
-		// 	continue
-		// }
-		// if dc.tcp.SrcPort == 0 && dc.tcp.DstPort == 0 {
-		// 	log.Printf("[DEBUG] TCP ports are zero in packet #%d, skipping", packetCount)
-		// 	continue
-		// }
-		// payload := dc.tcp.Payload
-		// if len(payload) == 0 {
-		// 	log.Printf("[DEBUG] No TCP payload in packet #%d (Flags: FIN=%v SYN=%v RST=%v PSH=%v ACK=%v URG=%v ECE=%v CWR=%v), skipping",
-		// 		packetCount, dc.tcp.FIN, dc.tcp.SYN, dc.tcp.RST, dc.tcp.PSH, dc.tcp.ACK, dc.tcp.URG, dc.tcp.ECE, dc.tcp.CWR)
-		// 	continue // pure ACK etc.
-		// }
-
-		// dstPort := uint16(dc.tcp.DstPort)
-		// // Filter by dest port we care about
-		// if (proxyPort > 0 && int(dstPort) == proxyPort) || (mongoPort > 0 && int(dstPort) == mongoPort) {
-		// 	k := flowKey{srcIP: srcIP, dstIP: dstIP, srcPort: uint16(dc.tcp.SrcPort), dstPt: dstPort}
-		// 	col.add(k, ci.Timestamp, payload)
-		// 	log.Printf("[DEBUG] Added payload for flowKey=%+v, ts=%v, payloadLen=%d", k, ci.Timestamp, len(payload))
-		// } else {
-		// 	log.Printf("[DEBUG] Packet #%d dstPort=%d does not match proxyPort=%d or mongoPort=%d, skipping", packetCount, dstPort, proxyPort, mongoPort)
-		// }
-
 		data, ci, err := r.ReadPacketData()
 		if err != nil {
 			log.Printf("[DEBUG] Error reading packet data: %v", err)
@@ -218,7 +152,7 @@ func StartReplay() {
 			break
 		}
 		packetCount++
-		log.Printf("[DEBUG] Packet #%d read at %v, length=%d", packetCount, ci.Timestamp, len(data))
+		// log.Printf("[DEBUG] Packet #%d read at %v, length=%d", packetCount, ci.Timestamp, len(data))
 
 		// Decode the layers (IPv4, TCP, etc.)
 		pkt := gopacket.NewPacket(data, layers.LayerTypeLinuxSLL2, gopacket.NoCopy)
@@ -236,16 +170,32 @@ func StartReplay() {
 			// Extract the payload
 			payload := t.Payload
 			if len(payload) == 0 {
-				log.Printf("[DEBUG] No TCP payload in packet #%d, skipping", packetCount)
+				// log.Printf("[DEBUG] No TCP payload in packet #%d, skipping", packetCount)
 				continue
 			}
 
 			// Collect payload for replay
 			srcIP, dstIP := pkt.NetworkLayer().NetworkFlow().Src().String(), pkt.NetworkLayer().NetworkFlow().Dst().String()
 			dstPort := uint16(t.DstPort)
-			k := flowKey{srcIP: srcIP, dstIP: dstIP, srcPort: uint16(t.SrcPort), dstPt: dstPort}
+			k := flowKeyDup{srcIP: srcIP, dstIP: dstIP, srcPort: uint16(t.SrcPort), dstPt: dstPort, payload: payload}
 
-			col.add(k, ci.Timestamp, payload)
+			if t.SrcPort != 16789 {
+				if srcPorts[uint16(t.SrcPort)] == nil {
+					srcPorts[uint16(t.SrcPort)] = []flowKeyDup{k}
+				} else {
+					srcPorts[uint16(t.SrcPort)] = append(srcPorts[uint16(t.SrcPort)], k)
+				}
+			}
+
+			if t.DstPort != 16789 {
+				if srcPorts[uint16(t.DstPort)] == nil {
+					srcPorts[uint16(t.DstPort)] = []flowKeyDup{k}
+				} else {
+					srcPorts[uint16(t.DstPort)] = append(srcPorts[uint16(t.DstPort)], k)
+				}
+			}
+
+			// col.add(k, ci.Timestamp, payload)
 
 			log.Printf("[DEBUG] Added payload for flowKey=%+v, ts=%v, payloadLen=%d", k, ci.Timestamp, len(payload))
 
@@ -274,46 +224,60 @@ func StartReplay() {
 
 	log.Printf("Collected streams: toProxy=%d fromProxy=%d", len(toProxy), len(fromProxy))
 
-	ctx := context.Background()
+	streamNumber := 1
 
-	// additionally serve the fromProxy responses to any incoming TCP client:
-	if len(fromProxy) > 0 {
-		log.Printf("Starting serveFromProxy on :16790 with %d streams", len(fromProxy))
-		go func() {
-			if err := serveFromProxy(ctx, ":16790", fromProxy, preserveTiming); err != nil {
-				log.Fatalf("serveFromProxy: %v", err)
+	for _, flowKeys := range srcPorts {
+		fmt.Printf("Stream #%d:\n", streamNumber)
+		for i, fk := range flowKeys {
+			fmt.Printf("  FlowKey #%d: srcIP=%s, dstIP=%s, srcPort=%d, dstPt=%d, payloadLen=%d\n",
+				i+1, fk.srcIP, fk.dstIP, fk.srcPort, fk.dstPt, len(fk.payload))
+			if len(fk.payload) > 0 {
+				fmt.Printf("    Payload (first 32 bytes): %x\n", fk.payload[:32])
 			}
-		}()
+		}
+		streamNumber++
 	}
 
-	time.Sleep(5 * time.Second) // Give the server some time to start
+	// ctx := context.Background()
 
-	// Replay helpers
-	replaySet := func(label, addr string, set []*stream) {
-		if addr == "" || len(set) == 0 {
-			return
-		}
-		log.Printf("Replaying %d streams %s to %s", len(set), label, addr)
-		sem := make(chan struct{}, max(1, concurrency))
-		var wg sync.WaitGroup
-		for _, s := range set {
-			s := s
-			sem <- struct{}{}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				defer func() { <-sem }()
-				if err := replayStream(ctx, addr, s, preserveTiming, connectTimeout, writeDelay); err != nil {
-					log.Printf("replay %s %v -> %s: %v", label, s.key, addr, err)
-				}
-			}()
-		}
-		wg.Wait()
-	}
+	// // additionally serve the fromProxy responses to any incoming TCP client:
+	// if len(fromProxy) > 0 {
+	// 	log.Printf("Starting serveFromProxy on :16790 with %d streams", len(fromProxy))
+	// 	go func() {
+	// 		if err := serveFromProxy(ctx, ":16790", fromProxy, preserveTiming); err != nil {
+	// 			log.Fatalf("serveFromProxy: %v", err)
+	// 		}
+	// 	}()
+	// }
 
-	// Run
-	replaySet("App→Proxy", proxyAddr, toProxy)
-	replaySet("Proxy→Mongo", mongoAddr, fromProxy)
+	// time.Sleep(5 * time.Second) // Give the server some time to start
+
+	// // Replay helpers
+	// replaySet := func(label, addr string, set []*stream) {
+	// 	if addr == "" || len(set) == 0 {
+	// 		return
+	// 	}
+	// 	log.Printf("Replaying %d streams %s to %s", len(set), label, addr)
+	// 	sem := make(chan struct{}, max(1, concurrency))
+	// 	var wg sync.WaitGroup
+	// 	for _, s := range set {
+	// 		sem <- struct{}{}
+	// 		wg.Add(1)
+	// 		go func(s *stream) {
+	// 			defer wg.Done()
+	// 			defer func() { <-sem }()
+	// 			fmt.Printf("Replaying %s %v -> %s\n", label, s.key, addr)
+	// 			if err := replayStream(ctx, addr, s, preserveTiming, connectTimeout, writeDelay); err != nil {
+	// 				log.Printf("replay %s %v -> %s: %v", label, s.key, addr, err)
+	// 			}
+	// 		}(s)
+	// 	}
+	// 	wg.Wait()
+	// }
+
+	// // Run
+	// replaySet("App→Proxy", proxyAddr, toProxy)
+	// replaySet("Proxy→Mongo", mongoAddr, fromProxy)
 	log.Printf("Done.")
 }
 
