@@ -276,6 +276,18 @@ func StartReplay() {
 
 	ctx := context.Background()
 
+	// additionally serve the fromProxy responses to any incoming TCP client:
+	if len(fromProxy) > 0 {
+		log.Printf("Starting serveFromProxy on :16790 with %d streams", len(fromProxy))
+		go func() {
+			if err := serveFromProxy(ctx, ":16790", fromProxy, preserveTiming); err != nil {
+				log.Fatalf("serveFromProxy: %v", err)
+			}
+		}()
+	}
+
+	time.Sleep(5 * time.Second) // Give the server some time to start
+
 	// Replay helpers
 	replaySet := func(label, addr string, set []*stream) {
 		if addr == "" || len(set) == 0 {
@@ -341,6 +353,29 @@ func replayStream(ctx context.Context, addr string, s *stream, preserve bool, di
 			return fmt.Errorf("flush chunk %d/%d: %w", i+1, len(s.pkts), err)
 		}
 	}
+
+	// Wait for a reply from the server.
+	// Set a read deadline to avoid waiting indefinitely.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("Failed to set read deadline for stream %v: %v", s.key, err)
+	}
+
+	// Read the response from the server.
+	br := bufio.NewReader(conn)
+	response, err := br.ReadString('\n')
+	if err != nil {
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			log.Printf("Timeout waiting for reply for stream %v", s.key)
+			return nil
+		}
+		if err.Error() == "EOF" {
+			log.Printf("Connection closed by server for stream %v (EOF)", s.key)
+			return nil
+		}
+		return fmt.Errorf("reading reply for stream %v: %w", s.key, err)
+	}
+	log.Printf("← %s | Received reply for stream %v: %s", addr, s.key, strings.TrimSpace(response))
+
 	return nil
 }
 
@@ -441,4 +476,148 @@ func decodeWithSLL2Fallback(link layers.LinkType, dc *decCtx, data []byte, decod
 	tmp := gopacket.NewDecodingLayerParser(first, &dc.ip4, &dc.ip6, &dc.tcp, &dc.udp)
 	*decoded = (*decoded)[:0]
 	return tmp.DecodeLayers(data[off:], decoded) == nil
+}
+
+// serveFromProxy starts a TCP server that replies with the next captured
+// Proxy→Client chunk every time *any* connected client sends a request.
+// Chunks are consumed globally (never per-connection). When the last chunk
+// is sent, the listener is closed.
+//
+// addr            - listen address, e.g. ":16790"
+// fromProxy       - the streams you already collected (Proxy→Client)
+// preserveTiming  - if true, sleep original inter-chunk gaps before replying
+// serveFromProxy starts a TCP server that replies with the next captured
+// Proxy→Client stream every time *any* connected client sends a request.
+// Streams are consumed globally (one per request). When the last stream
+// is sent, the listener is closed.
+//
+// addr            - listen address, e.g. ":16790"
+// fromProxy       - the streams you already collected (Proxy→Client)
+// preserveTiming  - if true, sleep original inter-chunk gaps before replying
+func serveFromProxy(ctx context.Context, addr string, fromProxy []*stream, preserveTiming bool) error {
+	// 1) fromProxy is already a time-ordered sequence of streams.
+	log.Printf("[serveFromProxy] collected %d streams", len(fromProxy))
+	if len(fromProxy) == 0 {
+		return errors.New("serveFromProxy: no streams in fromProxy")
+	}
+
+	// 2) Start listener.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	log.Printf("[serveFromProxy] listening on %s; %d reply streams ready", addr, len(fromProxy))
+
+	// Close listener on ctx cancel.
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	// 3) Global sequencing state (shared across all conns).
+	var (
+		mu        sync.Mutex // serialize access to stream index
+		streamIdx int        // next stream to send
+		exhaust   bool
+		exhOnce   sync.Once
+		closeLsn  = func() {
+			exhOnce.Do(func() {
+				exhaust = true
+				_ = ln.Close()
+			})
+		}
+	)
+
+	// 4) Accept loop.
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			if exhaust || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("accept: %w", err)
+			}
+		}
+
+		// 5) Per-connection goroutine: any read triggers "next global reply stream".
+		go func(conn net.Conn) {
+			defer conn.Close()
+			log.Printf("[serveFromProxy] client %s connected", conn.RemoteAddr())
+			buf := make([]byte, 64<<10)
+
+			for {
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+				n, rerr := conn.Read(buf)
+				if rerr != nil {
+					if !errors.Is(rerr, os.ErrDeadlineExceeded) && !strings.Contains(rerr.Error(), "timeout") {
+						log.Printf("[serveFromProxy] client %s read error: %v", conn.RemoteAddr(), rerr)
+					}
+					return
+				}
+				if n == 0 {
+					continue
+				}
+
+				log.Printf("[serveFromProxy] client %s sent request payload: %x", conn.RemoteAddr(), buf[:n])
+
+				// Lock to get the next stream to send.
+				mu.Lock()
+				if streamIdx >= len(fromProxy) {
+					mu.Unlock()
+					closeLsn()
+					log.Printf("[serveFromProxy] client %s: all streams exhausted; closing", conn.RemoteAddr())
+					return
+				}
+
+				// Get the stream and advance the index.
+				s := fromProxy[streamIdx]
+				streamIdx++
+
+				// If that was the last stream, prepare to close the listener.
+				isLastStream := streamIdx >= len(fromProxy)
+				mu.Unlock()
+
+				// Now, write all chunks of the selected stream.
+				start := time.Now()
+				var base time.Time
+				if preserveTiming && len(s.pkts) > 0 {
+					base = s.pkts[0].ts
+				}
+
+				for i, p := range s.pkts {
+					if preserveTiming {
+						// sleep to match inter-packet gaps relative to first packet
+						want := p.ts.Sub(base)
+						have := time.Since(start)
+						if want > have {
+							time.Sleep(want - have)
+						}
+					}
+
+					log.Printf("[serveFromProxy] about to write chunk %d/%d of stream %v (%d bytes) to %s",
+						i+1, len(s.pkts), s.key, len(p.data), conn.RemoteAddr())
+
+					if _, werr := conn.Write(p.data); werr != nil {
+						log.Printf("[serveFromProxy] client %s write error on stream %v chunk %d: %v",
+							conn.RemoteAddr(), s.key, i+1, werr)
+						return // End this connection's goroutine on write error.
+					}
+				}
+				log.Printf("[serveFromProxy] finished writing all %d chunks of stream %v to %s", len(s.pkts), s.key, conn.RemoteAddr())
+
+				if isLastStream {
+					closeLsn()
+					log.Printf("[serveFromProxy] all streams sent; listener closing (%d streams)", len(fromProxy))
+				}
+
+				// After sending one full stream, we are done with this request.
+				// The client must send another request to get the next stream.
+				return
+			}
+		}(c)
+	}
 }
