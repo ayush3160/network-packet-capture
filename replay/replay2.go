@@ -1,7 +1,6 @@
 package replay
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -121,103 +120,127 @@ func startAppSideServer(listenAddr string, feeder *responseFeeder) (stop func(),
 	var wg sync.WaitGroup
 	shutdown := make(chan struct{})
 
-	serveConn := func(c net.Conn) {
-		defer c.Close()
-		br := bufio.NewReader(c)
+	// drainUntilEOF keeps reading until EOF or shutdown
+	drainUntilEOF := func(c net.Conn, shutdown <-chan struct{}) {
+		buf := make([]byte, 8<<10)
 		for {
-			// Block until client sends a request
-			// We read whatever they send, up to a delimiter or short timeout.
-			// For simplicity, read what's available (non-framing).
-			c.SetReadDeadline(time.Now().Add(5 * time.Minute))
-			_, err := br.Peek(1)
-			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					continue
-				}
-				if errors.Is(err, io.EOF) {
-					return
-				}
-				// other error -> close conn
-				return
-			}
-			// Drain available bytes (request). We don't need them; we just need the event.
-			c.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-			buf := make([]byte, 4096)
-			totalRead := 0
-			for {
-				n, er := br.Read(buf)
-				if n > 0 {
-					totalRead += n // accumulate bytes read
-				}
-				if er != nil {
-					if ne, ok := er.(net.Error); ok && ne.Timeout() {
-						break
-					}
-					if errors.Is(er, io.EOF) {
-						break
-					}
-					break
-				}
-				if n < len(buf) {
-					break
-				}
-			}
-			log.Printf("[SERVER] received request of length %d bytes", totalRead)
-
-			// Pop next response and write it
+			// Keep a soft deadline so we don't hang forever if peer misbehaves.
+			_ = c.SetReadDeadline(time.Now().Add(2 * time.Minute))
 			select {
 			case <-shutdown:
 				return
-			case <-feeder.done:
-				return
 			default:
 			}
-			resp, ok := feeder.pop(shutdown)
-			if !ok {
+			_, err := c.Read(buf)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					// Keep looping; extend grace period.
+					continue
+				}
+				// io.EOF (peer FIN) or any other read error -> stop draining.
 				return
 			}
-			c.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if _, err := c.Write(resp); err != nil {
-				log.Printf("[SERVER] write error: %v", err)
-				return
-			}
-			log.Printf("[SERVER] proxy→app wrote response of length %d bytes", len(resp))
 		}
+	}
+
+	serveConn := func(c net.Conn) {
+		// If we can, get TCPConn to use half-close
+		tcp, _ := c.(*net.TCPConn)
+		defer c.Close()
+
+		// Indicate that the TCP connection is established
+		log.Printf("[SERVER] TCP connection established")
+
+		// Push responses as they become available.
+		for {
+			select {
+			case <-shutdown:
+				log.Printf("[SERVER] shutdown received, stopping writes")
+				goto afterWrites
+			case <-feeder.done:
+				log.Printf("[SERVER] feeder done, stopping writes")
+				goto afterWrites
+			default:
+				resp, ok := feeder.pop(shutdown)
+				if !ok {
+					log.Printf("[SERVER] feeder closed, stopping writes")
+					goto afterWrites
+				}
+				_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := c.Write(resp); err != nil {
+					log.Printf("[SERVER] write error: %v", err)
+					goto afterWrites
+				}
+				log.Printf("[SERVER] proxy→app wrote response of length %d bytes", len(resp))
+			}
+		}
+
+	afterWrites:
+		// === Graceful close sequence ===
+		// 1) Half-close write side to signal "no more bytes coming".
+		if tcp != nil {
+			if err := tcp.CloseWrite(); err != nil {
+				log.Printf("[SERVER] CloseWrite error: %v", err)
+			} else {
+				log.Printf("[SERVER] CloseWrite done (sent FIN)")
+			}
+		} else {
+			// Fallback: set a tiny read deadline to avoid hanging forever.
+			log.Printf("[SERVER] non-TCPConn, skipping CloseWrite")
+		}
+
+		// 2) Drain until the peer closes their write side (we see EOF) or shutdown.
+		drainUntilEOF(c, shutdown)
+		// 3) defer will Close() the socket now.
 	}
 
 	acceptLoop := func() {
 		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				select {
-				case <-shutdown:
-					return
-				default:
+			select {
+			case <-shutdown: // This ensures that shutdown signal is processed
+				log.Printf("[SERVER] acceptLoop exiting")
+				return
+			default:
+				conn, err := ln.Accept()
+				if err != nil {
+					select {
+					case <-shutdown:
+						log.Printf("[SERVER] acceptLoop exiting due to shutdown")
+						return
+					default:
+					}
+					log.Printf("[SERVER] accept error: %v", err)
+					continue
 				}
-				log.Printf("[SERVER] accept error: %v", err)
-				continue
+				wg.Add(1)
+				go func() {
+					defer func() {
+						log.Printf("[SERVER] goroutine for serveConn(conn) exiting, calling wg.Done()")
+						wg.Done()
+					}()
+					serveConn(conn)
+				}()
 			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				serveConn(conn)
-			}()
 		}
 	}
+
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer func() {
+			log.Printf("[SERVER] goroutine for acceptLoop() exiting, calling wg.Done()")
+			wg.Done()
+		}()
 		acceptLoop()
 	}()
 
 	stop = func() {
 		close(shutdown)
+		// Wake any handlers waiting in pop()
+		feeder.close()
 		err = ln.Close()
 		if err != nil {
 			log.Printf("[SERVER] close error: %v", err)
 		}
-		// Wake any handlers waiting in pop()
-		feeder.close()
 		log.Printf("[SERVER] stopped")
 	}
 	return stop, nil
@@ -241,7 +264,7 @@ func replaySequence(
 	if err != nil {
 		return err
 	}
-	defer func() { fmt.Printf("Stopping the server"); stopServer() }()
+	defer func() { stopServer() }()
 
 	// Connect to proxy
 	if proxyAddr == "" {
@@ -251,7 +274,9 @@ func replaySequence(
 	if err != nil {
 		return fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
-	defer proxyConn.Close()
+
+	defer func() { proxyConn.Close() }()
+
 	log.Printf("[REPLAY] connected to proxy at %s", proxyAddr)
 
 	// For graceful half-close later
@@ -319,7 +344,7 @@ func replaySequence(
 
 	// Tell proxy we’re done sending, but keep reading until it closes (if it wants).
 	if tcpC != nil {
-		_ = tcpC.CloseWrite()
+		_ = tcpC.Close()
 	}
 
 	log.Printf("[REPLAY] sequence finished")
@@ -348,7 +373,7 @@ func StartReplay2() {
 	flag.IntVar(&mongoPort, "mongoPort", 27017, "Destination port in pcap considered 'mongo' (unused here)")
 	flag.BoolVar(&preserveTiming, "preserveTiming", false, "Sleep according to inter-packet gaps per stream")
 	flag.DurationVar(&connectTimeout, "connectTimeout", 5*time.Second, "Dial timeout for live sockets")
-	flag.DurationVar(&writeDelay, "writeDelay", 0, "Fixed delay between packet writes (added after preserveTiming)")
+	flag.DurationVar(&writeDelay, "writeDelay", 10*time.Millisecond, "Fixed delay between packet writes (added after preserveTiming)")
 	flag.IntVar(&concurrency, "concurrency", 1, "Max parallel stream replays per direction")
 	flag.Parse()
 
@@ -381,9 +406,11 @@ func StartReplay2() {
 	// srcPorts will contain exactly ONE stream in your case, ordered later by ts.
 	srcPorts := make(map[uint16][]flowKeyDup)
 
+	seenSeqNums := make(map[uint32]bool) // checking for duplicates, incase of tcp retransmits
+
 	packetCount := 0
 	for {
-		data, ci, err := r.ReadPacketData()
+		data, ci, err := r.ZeroCopyReadPacketData()
 		if err != nil {
 			if errors.Is(err, os.ErrClosed) || err == io.EOF || strings.Contains(strings.ToLower(err.Error()), "eof") {
 				break
@@ -394,7 +421,7 @@ func StartReplay2() {
 		packetCount++
 
 		// Linux SLL2 is common in containers; adjust if your pcap is Ethernet etc.
-		pkt := gopacket.NewPacket(data, layers.LayerTypeLinuxSLL2, gopacket.NoCopy)
+		pkt := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.NoCopy)
 		tl := pkt.TransportLayer()
 		if tl == nil {
 			continue
@@ -416,6 +443,13 @@ func StartReplay2() {
 		if len(tcp.Payload) == 0 {
 			continue
 		}
+
+		if seenSeqNums[tcp.Seq] {
+			log.Printf("[DEBUG] duplicate seq %d, skipping", tcp.Seq)
+			continue
+		}
+
+		seenSeqNums[tcp.Seq] = true
 
 		srcIP := ip.NetworkFlow().Src().String()
 		dstIP := ip.NetworkFlow().Dst().String()
@@ -444,9 +478,9 @@ func StartReplay2() {
 			srcPorts[ev.dstPt] = append(srcPorts[ev.dstPt], ev)
 		}
 
-		log.Printf("[DEBUG] add ev ts=%s dir=%v len=%d src=%s:%d dst=%s:%d",
-			ev.ts.Format(time.RFC3339Nano), ev.dir, len(ev.payload),
-			ev.srcIP, ev.srcPort, ev.dstIP, ev.dstPt)
+		// log.Printf("[DEBUG] add ev ts=%s dir=%v len=%d src=%s:%d dst=%s:%d",
+		// 	ev.ts.Format(time.RFC3339Nano), ev.dir, len(ev.payload),
+		// 	ev.srcIP, ev.srcPort, ev.dstIP, ev.dstPt)
 	}
 
 	// For simplicity, pick the first stream (you mentioned there's one)

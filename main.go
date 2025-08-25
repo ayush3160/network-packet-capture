@@ -62,7 +62,7 @@ func main() {
 	defer f.Close()
 
 	w := pcapgo.NewWriter(f)
-	if err := w.WriteFileHeader(uint32(snaplen), layers.LinkTypeLinuxSLL2); err != nil {
+	if err := w.WriteFileHeader(uint32(snaplen), layers.LinkTypeEthernet); err != nil {
 		log.Fatalf("writing pcap header: %v", err)
 	}
 	log.Printf("✳️ writing packets to %s", outPath)
@@ -151,13 +151,9 @@ func main() {
 						continue
 					}
 				}
-				// first := layers.LayerTypeIPv4
-				// if len(data) > 0 && (data[0]>>4) == 6 {
-				// 	first = layers.LayerTypeIPv6
-				// }
 
 				// Decode just enough to test ports
-				pkt := gopacket.NewPacket(data, layers.LinkTypeLinuxSLL2, gopacket.NoCopy)
+				pkt := gopacket.NewPacket(data, layers.LinkTypeEthernet, gopacket.NoCopy)
 				tl := pkt.TransportLayer()
 				if tl == nil {
 					continue
@@ -197,19 +193,19 @@ func main() {
 				}
 
 				// Copy into stable slice for pcapgo
-				writeData := make([]byte, len(data))
-				copy(writeData, data)
+				// writeData := make([]byte, len(data))
+				// copy(writeData, data)
 
 				// Write
 				writeMu.Lock()
-				if err := w.WritePacket(ci, writeData); err != nil {
+				if err := w.WritePacket(ci, data); err != nil {
 					log.Printf("pcap write error: %v", err)
 				}
 				writeMu.Unlock()
 
 				if n := atomic.AddUint64(&total, 1); n%10000 == 0 {
 					elapsed := time.Since(start).Truncate(time.Second)
-					log.Printf("… captured %,d matching packets (%,d total seen) in %s", n, atomic.LoadUint64(&seen), elapsed)
+					log.Printf("… captured %d matching packets (%d total seen) in %s", n, atomic.LoadUint64(&seen), elapsed)
 				}
 			}
 		}()
@@ -225,7 +221,7 @@ func main() {
 			log.Printf("📊 [%s] received=%d (dropped N/A w/TPACKETv3)", j.name, stats.Packets)
 		}
 	}
-	log.Printf("✅ done. total packets written: %,d", atomic.LoadUint64(&total))
+	log.Printf("✅ done. total packets written: %d", atomic.LoadUint64(&total))
 }
 
 // resolveTargets returns the list of interface names to capture on.
